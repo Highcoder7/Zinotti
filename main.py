@@ -13,8 +13,8 @@ from aiogram.fsm.storage.memory import MemoryStorage
 from google import genai
 from google.genai import types
 
-BOT_TOKEN = os.environ["BOT_TOKEN"]
-GEMINI_API_KEY = os.environ["GEMINI_API_KEY"]
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "8769687821:AAEu9aGSIwkiVYBhx3IoT3vBrOEBD0OXQck")
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "AIzaSyD7Wh_aDSLXzFo0ecTuTNVIRYLdaQg_sp4")
 GEMINI_MODEL = "gemini-3.1-flash-image-preview"
 
 FURNITURE_TYPES = [
@@ -68,13 +68,21 @@ def generate_interior(furniture_type: str, image_bytes: bytes, description: str)
         model=GEMINI_MODEL,
         contents=[prompt, pil_image],
         config=types.GenerateContentConfig(
-            response_modalities=["IMAGE", "TEXT"],
+            response_modalities=["TEXT", "IMAGE"],
             image_config=types.ImageConfig(
                 aspect_ratio="4:3",
                 image_size="1K",
             ),
+            thinking_config=types.ThinkingConfig(
+                thinking_level="minimal",
+            ),
         ),
     )
+
+    logger.info("Gemini response parts: %d", len(response.parts))
+    for i, part in enumerate(response.parts):
+        is_thought = getattr(part, "thought", False)
+        logger.info("Part %d: thought=%s text=%s has_image=%s", i, is_thought, bool(part.text), bool(part.as_image()))
 
     for part in response.parts:
         if getattr(part, "thought", False):
@@ -172,7 +180,10 @@ async def run_generation(message: Message, state: FSMContext, is_callback: bool 
     processing = await message.answer("⏳ Генерирую ваши варианты...")
 
     try:
-        result = await asyncio.to_thread(generate_interior, furniture_type, image_bytes, description)
+        result = await asyncio.wait_for(
+            asyncio.to_thread(generate_interior, furniture_type, image_bytes, description),
+            timeout=120,
+        )
 
         await bot.delete_message(message.chat.id, processing.message_id)
 
@@ -187,15 +198,27 @@ async def run_generation(message: Message, state: FSMContext, is_callback: bool 
                 "Не удалось сгенерировать изображение. Попробуйте снова.",
                 reply_markup=result_keyboard(),
             )
-    except Exception as e:
-        logger.error(f"Generation error: {e}")
+    except asyncio.TimeoutError:
+        logger.error("Generation timed out after 120s")
         try:
             await bot.delete_message(message.chat.id, processing.message_id)
         except Exception:
             pass
         await message.answer(
-            "Произошла ошибка при генерации. Попробуйте ещё раз.",
+            "⏱ Генерация заняла слишком долго. Попробуйте снова.",
             reply_markup=result_keyboard(),
+        )
+    except Exception as e:
+        import traceback
+        logger.error(f"Generation error: {e}\n{traceback.format_exc()}")
+        try:
+            await bot.delete_message(message.chat.id, processing.message_id)
+        except Exception:
+            pass
+        await message.answer(
+            f"Произошла ошибка:\n<code>{e}</code>\n\nПопробуйте ещё раз.",
+            reply_markup=result_keyboard(),
+            parse_mode="HTML",
         )
 
 
