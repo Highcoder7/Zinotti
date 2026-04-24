@@ -69,13 +69,6 @@ def generate_interior(furniture_type: str, image_bytes: bytes, description: str)
         contents=[prompt, pil_image],
         config=types.GenerateContentConfig(
             response_modalities=["TEXT", "IMAGE"],
-            image_config=types.ImageConfig(
-                aspect_ratio="4:3",
-                image_size="1K",
-            ),
-            thinking_config=types.ThinkingConfig(
-                thinking_level="minimal",
-            ),
         ),
     )
 
