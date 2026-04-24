@@ -2,9 +2,11 @@ import asyncio
 import logging
 import io
 import os
+from PIL import Image
 from aiogram import Bot, Dispatcher, F
-from aiogram.types import Message, BufferedInputFile
-from aiogram.filters import CommandStart, Command
+from aiogram.types import Message, BufferedInputFile, CallbackQuery
+from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
+from aiogram.filters import CommandStart
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
@@ -15,14 +17,20 @@ BOT_TOKEN = os.environ["BOT_TOKEN"]
 GEMINI_API_KEY = os.environ["GEMINI_API_KEY"]
 GEMINI_MODEL = "gemini-3.1-flash-image-preview"
 
-SYSTEM_PROMPT = """Ты профессиональный ИИ-дизайнер интерьера для мебельной компании.
-Твоя задача — обставить комнату мебелью согласно описанию пользователя.
-Требования к результату:
-- Фотореалистичное изображение высокого качества (8K, photorealistic)
-- Мебель должна точно вписываться в геометрию и перспективу комнаты
-- Учитывай пожелания по стилю, цвету и материалам
-- Красивое, профессиональное освещение
-- Стиль: interior design magazine, architectural photography"""
+FURNITURE_TYPES = [
+    "Кухня", "Ванная", "Шкаф", "Шкафы купе",
+    "Прихожая", "Спальня", "Гардероб", "ТВ-зона",
+]
+
+SYSTEM_PROMPT = (
+    "Ты профессиональный ИИ-дизайнер интерьера компании Zinotti. "
+    "На основе предоставленного фото (комната, чертёж или 3D-эскиз) создай "
+    "фотореалистичный рендер интерьера с мебелью типа: {furniture_type}. "
+    "Требования: photorealistic, 8K, interior design magazine style, "
+    "мебель точно вписана в геометрию и перспективу, профессиональное освещение. "
+    "Если подан чертёж или 3D — преврати его в фотореалистичный рендер. "
+    "Пожелания клиента: {description}"
+)
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -30,32 +38,52 @@ logger = logging.getLogger(__name__)
 gemini_client = genai.Client(api_key=GEMINI_API_KEY)
 
 
-class DesignFlow(StatesGroup):
+class Flow(StatesGroup):
+    waiting_for_photo = State()
     waiting_for_description = State()
+    generated = State()
 
 
-def generate_interior(description: str, image_bytes: bytes | None = None) -> bytes | None:
-    parts = []
+def furniture_keyboard() -> InlineKeyboardMarkup:
+    rows = []
+    for i in range(0, len(FURNITURE_TYPES), 2):
+        pair = FURNITURE_TYPES[i:i + 2]
+        rows.append([InlineKeyboardButton(text=t, callback_data=f"furniture:{t}") for t in pair])
+    rows.append([InlineKeyboardButton(text="🔁 СТАРТ", callback_data="restart")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 
-    if image_bytes:
-        parts.append(types.Part.from_bytes(data=image_bytes, mime_type="image/jpeg"))
 
-    full_prompt = f"{SYSTEM_PROMPT}\n\nЗапрос пользователя: {description}"
-    parts.append(types.Part.from_text(text=full_prompt))
+def result_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🔄 Ещё варианты", callback_data="more")],
+        [InlineKeyboardButton(text="🔁 СТАРТ", callback_data="restart")],
+    ])
 
-    contents = [types.Content(role="user", parts=parts)]
+
+def generate_interior(furniture_type: str, image_bytes: bytes, description: str) -> bytes | None:
+    prompt = SYSTEM_PROMPT.format(furniture_type=furniture_type, description=description)
+    pil_image = Image.open(io.BytesIO(image_bytes))
 
     response = gemini_client.models.generate_content(
         model=GEMINI_MODEL,
-        contents=contents,
+        contents=[prompt, pil_image],
         config=types.GenerateContentConfig(
             response_modalities=["IMAGE", "TEXT"],
+            image_config=types.ImageConfig(
+                aspect_ratio="4:3",
+                image_size="1K",
+            ),
         ),
     )
 
-    for part in response.candidates[0].content.parts:
-        if part.inline_data:
-            return part.inline_data.data
+    for part in response.parts:
+        if getattr(part, "thought", False):
+            continue
+        img = part.as_image()
+        if img:
+            buf = io.BytesIO()
+            img.save(buf, format="PNG")
+            return buf.getvalue()
 
     return None
 
@@ -64,109 +92,115 @@ bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher(storage=MemoryStorage())
 
 
+async def send_type_selection(target: Message | CallbackQuery, state: FSMContext):
+    await state.clear()
+    text = (
+        "👋 Добро пожаловать в <b>Zinotti</b>!\n\n"
+        "Я ИИ-дизайнер интерьера. Загрузите фото комнаты, чертёж или 3D-эскиз "
+        "— и я покажу, как будет выглядеть готовый результат.\n\n"
+        "Выберите тип мебели:"
+    )
+    if isinstance(target, CallbackQuery):
+        await target.message.answer(text, reply_markup=furniture_keyboard(), parse_mode="HTML")
+    else:
+        await target.answer(text, reply_markup=furniture_keyboard(), parse_mode="HTML")
+
+
 @dp.message(CommandStart())
 async def cmd_start(message: Message, state: FSMContext):
-    await state.clear()
-    await message.answer(
-        "Привет! Я ИИ-дизайнер интерьера 🛋\n\n"
-        "Отправь мне:\n"
-        "📷 *Фото комнаты* — и я обставлю её мебелью\n"
-        "✏️ *Только текст* — и я создам дизайн с нуля\n\n"
-        "Пример: \"Белая кухня в стиле минимализм с подсветкой\"",
-        parse_mode="Markdown",
+    await send_type_selection(message, state)
+
+
+@dp.callback_query(F.data == "restart")
+async def cb_restart(callback: CallbackQuery, state: FSMContext):
+    await callback.answer()
+    await send_type_selection(callback, state)
+
+
+@dp.callback_query(F.data.startswith("furniture:"))
+async def cb_furniture(callback: CallbackQuery, state: FSMContext):
+    furniture_type = callback.data.split(":", 1)[1]
+    await state.update_data(furniture_type=furniture_type)
+    await state.set_state(Flow.waiting_for_photo)
+    await callback.answer()
+    await callback.message.answer(
+        f"✅ Выбрано: <b>{furniture_type}</b>\n\n"
+        "📷 Пришлите фото комнаты, чертёж или 3D-эскиз.",
+        parse_mode="HTML",
     )
 
 
-@dp.message(Command("help"))
-async def cmd_help(message: Message):
-    await message.answer(
-        "Как пользоваться ботом:\n\n"
-        "1️⃣ Отправь фото пустой комнаты или эскиз\n"
-        "2️⃣ Опиши желаемый стиль (цвет, материалы, стиль)\n"
-        "3️⃣ Получи фотореалистичный рендер с мебелью\n\n"
-        "Команды:\n"
-        "/start — начать заново\n"
-        "/help — эта справка"
-    )
-
-
-@dp.message(F.photo)
+@dp.message(Flow.waiting_for_photo, F.photo)
 async def handle_photo(message: Message, state: FSMContext):
     photo = message.photo[-1]
     file = await bot.get_file(photo.file_id)
-    file_bytes = await bot.download_file(file.file_path)
-    image_data = file_bytes.read()
-
-    await state.update_data(image=image_data)
-    await state.set_state(DesignFlow.waiting_for_description)
-
-    await message.answer(
-        "Фото получено! Теперь опиши желаемый дизайн:\n\n"
-        "Например: *\"Гостиная в скандинавском стиле, светлые тона, дерево и белый цвет\"*",
-        parse_mode="Markdown",
-    )
+    file_io = await bot.download_file(file.file_path)
+    await state.update_data(image=file_io.read())
+    await state.set_state(Flow.waiting_for_description)
+    await message.answer("✏️ Опишите, что нужно добавить (на русском).")
 
 
-@dp.message(DesignFlow.waiting_for_description)
-async def handle_description_after_photo(message: Message, state: FSMContext):
-    if not message.text:
-        await message.answer("Пожалуйста, опиши желаемый дизайн текстом.")
-        return
+@dp.message(Flow.waiting_for_photo)
+async def handle_photo_wrong(message: Message):
+    await message.answer("📷 Пожалуйста, отправьте фото комнаты, чертёж или 3D-эскиз.")
 
+
+@dp.message(Flow.waiting_for_description, F.text)
+async def handle_description(message: Message, state: FSMContext):
+    await state.update_data(description=message.text)
+    await state.set_state(Flow.generated)
+    await run_generation(message, state)
+
+
+@dp.message(Flow.waiting_for_description)
+async def handle_description_wrong(message: Message):
+    await message.answer("✏️ Пожалуйста, опишите пожелания текстом.")
+
+
+@dp.callback_query(F.data == "more", Flow.generated)
+async def cb_more(callback: CallbackQuery, state: FSMContext):
+    await callback.answer()
+    await run_generation(callback.message, state, is_callback=True)
+
+
+async def run_generation(message: Message, state: FSMContext, is_callback: bool = False):
     data = await state.get_data()
+    furniture_type = data.get("furniture_type", "")
     image_bytes = data.get("image")
-    await state.clear()
+    description = data.get("description", "")
 
-    processing_msg = await message.answer("Генерирую дизайн... Это займёт около 30 секунд ⏳")
+    processing = await message.answer("⏳ Генерирую ваши варианты...")
 
     try:
-        result = await asyncio.to_thread(generate_interior, message.text, image_bytes)
+        result = await asyncio.to_thread(generate_interior, furniture_type, image_bytes, description)
+
+        await bot.delete_message(message.chat.id, processing.message_id)
 
         if result:
-            await bot.delete_message(message.chat.id, processing_msg.message_id)
             await message.answer_photo(
-                BufferedInputFile(result, filename="interior.jpg"),
-                caption="Готово! Ваш дизайн интерьера 🏠",
+                BufferedInputFile(result, filename="zinotti_design.png"),
+                caption="✅ Ваши готовые варианты.\n\nНажмите, если хотите другие варианты.",
+                reply_markup=result_keyboard(),
             )
         else:
-            await processing_msg.edit_text("Не удалось сгенерировать изображение. Попробуй ещё раз.")
+            await message.answer(
+                "Не удалось сгенерировать изображение. Попробуйте снова.",
+                reply_markup=result_keyboard(),
+            )
     except Exception as e:
         logger.error(f"Generation error: {e}")
         try:
-            await processing_msg.edit_text(f"Произошла ошибка. Попробуй ещё раз или напиши /start")
+            await bot.delete_message(message.chat.id, processing.message_id)
         except Exception:
-            await message.answer("Произошла ошибка. Попробуй ещё раз или напиши /start")
-
-
-@dp.message(F.text)
-async def handle_text_only(message: Message, state: FSMContext):
-    current_state = await state.get_state()
-    if current_state == DesignFlow.waiting_for_description.state:
-        return
-
-    processing_msg = await message.answer("Генерирую дизайн по описанию... ⏳")
-
-    try:
-        result = await asyncio.to_thread(generate_interior, message.text)
-
-        if result:
-            await bot.delete_message(message.chat.id, processing_msg.message_id)
-            await message.answer_photo(
-                BufferedInputFile(result, filename="interior.jpg"),
-                caption="Готово! Ваш дизайн интерьера 🏠",
-            )
-        else:
-            await processing_msg.edit_text("Не удалось сгенерировать изображение. Попробуй описать подробнее.")
-    except Exception as e:
-        logger.error(f"Generation error: {e}")
-        try:
-            await processing_msg.edit_text("Произошла ошибка. Попробуй ещё раз.")
-        except Exception:
-            await message.answer("Произошла ошибка. Попробуй ещё раз.")
+            pass
+        await message.answer(
+            "Произошла ошибка при генерации. Попробуйте ещё раз.",
+            reply_markup=result_keyboard(),
+        )
 
 
 async def main():
-    logger.info("Bot started")
+    logger.info("Zinotti bot started")
     await dp.start_polling(bot)
 
 
